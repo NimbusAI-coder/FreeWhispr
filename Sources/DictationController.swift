@@ -54,6 +54,7 @@ final class DictationController {
                 try await self.transcriber.begin()
                 try self.capture.start()
                 sound("Tink")
+                self.watchForDeadInput()
             } catch {
                 self.fail(error.localizedDescription)
             }
@@ -69,6 +70,9 @@ final class DictationController {
         isRecording = false
         onStateChange?(false)
 
+        // Read the peak before stopping tears the session down.
+        let peak = capture.sessionPeak
+        let device = capture.inputDeviceName
         capture.stop()
 
         // Ignore accidental taps that produced no meaningful audio.
@@ -87,8 +91,24 @@ final class DictationController {
             let raw = await self.transcriber.finish()
 
             guard !raw.isEmpty else {
-                self.overlay.hide()
-                sound("Basso")
+                // Nothing transcribed. Distinguish "the mic delivered pure
+                // digital silence" — which means a revoked grant, a muted or
+                // wrong input device, or a hardware mute switch — from "audio
+                // arrived but held no speech". macOS reports a revoked
+                // microphone by feeding zeroed buffers rather than failing, so
+                // without this check both cases look identical to the user.
+                if peak < AudioCapture.silenceThreshold {
+                    self.fail("""
+                        No audio reached \(device) — the level never moved. \
+                        Check that FreeWhispr is enabled in System Settings › \
+                        Privacy & Security › Microphone, that the right input \
+                        device is selected in Sound settings, and that the mic \
+                        is not muted.
+                        """)
+                } else {
+                    self.overlay.hide()
+                    sound("Basso")
+                }
                 return
             }
 
@@ -134,6 +154,17 @@ final class DictationController {
         overlay.hide()
         onError?(message)
         sound("Basso")
+    }
+
+    /// Flags a dead input mid-session, so a revoked microphone shows up while
+    /// the overlay is on screen rather than as a silent no-op at the end.
+    private func watchForDeadInput() {
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            guard self.isRecording else { return }
+            guard self.capture.sessionPeak < AudioCapture.silenceThreshold else { return }
+            self.overlay.setStatus("No audio — check mic access")
+        }
     }
 
     private func ensureMicrophoneAccess() async -> Bool {

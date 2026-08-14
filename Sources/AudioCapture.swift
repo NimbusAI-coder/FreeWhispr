@@ -8,6 +8,29 @@ final class AudioCapture {
     private let engine = AVAudioEngine()
     private var tapInstalled = false
 
+    /// Loudest sample seen since the last `start()`. The audio thread writes it
+    /// and the main thread reads it after the session, so it is lock-guarded.
+    private var peakLock = os_unfair_lock_s()
+    private var _sessionPeak: Float = 0
+
+    /// Highest input level observed during the session, 0 when the device
+    /// delivered nothing but digital silence.
+    var sessionPeak: Float {
+        os_unfair_lock_lock(&peakLock)
+        defer { os_unfair_lock_unlock(&peakLock) }
+        return _sessionPeak
+    }
+
+    /// A revoked microphone grant is not reported as an error — macOS simply
+    /// feeds the tap zero-filled buffers. Anything above this counts as real
+    /// signal; room tone alone clears it comfortably.
+    static let silenceThreshold: Float = 0.0005
+
+    /// Name of the device actually being recorded from, for error messages.
+    var inputDeviceName: String {
+        AVCaptureDevice.default(for: .audio)?.localizedName ?? "the default input"
+    }
+
     /// Called on the audio thread. Keep the work here short.
     var onBuffer: ((AVAudioPCMBuffer) -> Void)?
     /// Rough 0...1 input level, for the recording indicator.
@@ -19,6 +42,10 @@ final class AudioCapture {
 
     func start() throws {
         guard !engine.isRunning else { return }
+
+        os_unfair_lock_lock(&peakLock)
+        _sessionPeak = 0
+        os_unfair_lock_unlock(&peakLock)
 
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
@@ -33,8 +60,12 @@ final class AudioCapture {
         input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
             guard let self else { return }
             self.onBuffer?(buffer)
-            if let level = Self.peakLevel(of: buffer) {
-                self.onLevel?(level)
+            if let raw = Self.rawPeak(of: buffer) {
+                os_unfair_lock_lock(&self.peakLock)
+                self._sessionPeak = max(self._sessionPeak, raw)
+                os_unfair_lock_unlock(&self.peakLock)
+                // Compress the range so quiet speech still moves the indicator.
+                self.onLevel?(min(1, raw * 3))
             }
         }
         tapInstalled = true
@@ -54,7 +85,8 @@ final class AudioCapture {
         engine.reset()
     }
 
-    private static func peakLevel(of buffer: AVAudioPCMBuffer) -> Float? {
+    /// Uncompressed peak amplitude, 0...1.
+    private static func rawPeak(of buffer: AVAudioPCMBuffer) -> Float? {
         guard let channels = buffer.floatChannelData else { return nil }
         let frames = Int(buffer.frameLength)
         guard frames > 0 else { return nil }
@@ -63,7 +95,6 @@ final class AudioCapture {
         for sample in 0..<frames {
             peak = max(peak, abs(channels[0][sample]))
         }
-        // Compress the range so quiet speech still moves the indicator.
-        return min(1, peak * 3)
+        return peak
     }
 }
