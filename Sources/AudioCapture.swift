@@ -5,7 +5,12 @@ import Foundation
 /// Nothing is ever written to disk — buffers go straight to the on-device
 /// transcriber and are released.
 final class AudioCapture {
-    private let engine = AVAudioEngine()
+    /// Rebuilt for every session. A long-lived engine caches its binding to the
+    /// input hardware, and neither `reset()` nor `stop()` re-establishes it — so
+    /// after a device change or enough start/stop cycles the engine keeps
+    /// running while delivering pure silence, with no error anywhere. A fresh
+    /// instance re-resolves the current default input every time.
+    private var engine = AVAudioEngine()
     private var tapInstalled = false
 
     /// Loudest sample seen since the last `start()`. The audio thread writes it
@@ -46,6 +51,15 @@ final class AudioCapture {
         os_unfair_lock_lock(&peakLock)
         _sessionPeak = 0
         os_unfair_lock_unlock(&peakLock)
+
+        // Discard the previous engine rather than reusing it; see the property
+        // comment. Cheap to construct, and the only reliable way to pick up the
+        // input device that is current *now*.
+        if tapInstalled {
+            engine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        engine = AVAudioEngine()
 
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
