@@ -13,6 +13,7 @@ actor Transcriber {
     enum TranscriberError: LocalizedError {
         case unavailable
         case unsupportedLocale(String)
+        case modelNotReady(String)
         case noCompatibleFormat
 
         var errorDescription: String? {
@@ -21,6 +22,12 @@ actor Transcriber {
                 return "On-device speech recognition is unavailable on this Mac."
             case .unsupportedLocale(let id):
                 return "Speech recognition does not support the locale \"\(id)\"."
+            case .modelNotReady(let id):
+                return """
+                    The \(id) speech model is not installed yet. macOS downloads \
+                    it on first use, which needs a network connection once. \
+                    Check your connection and try again in a moment.
+                    """
             case .noCompatibleFormat:
                 return "Could not negotiate an audio format with the speech analyzer."
             }
@@ -46,20 +53,50 @@ actor Transcriber {
         guard let supported = await SpeechTranscriber.supportedLocale(equivalentTo: locale)
         else { return }
         let module = SpeechTranscriber(locale: supported, preset: .progressiveTranscription)
+        // Same ordering as `begin()`: without reserving first, the asset check
+        // reports `.supported` forever and the model is never fetched.
+        _ = try? await AssetInventory.reserve(locale: supported)
         _ = try? await Self.ensureModelInstalled(for: [module])
     }
 
     /// Downloads the language asset if the system does not have it yet.
     /// Returns once the model is usable.
-    private static func ensureModelInstalled(for modules: [any SpeechModule]) async throws -> Bool {
-        let status = await AssetInventory.status(forModules: modules)
-        if status == .installed { return true }
-        if status == .unsupported { return false }
+    /// Result of an asset check, kept distinct from "the locale is unsupported"
+    /// so a model that is merely still downloading is not reported as a
+    /// permanently broken language.
+    enum ModelState {
+        case ready
+        case unsupported
+        case notReady
+    }
 
-        if let request = try await AssetInventory.assetInstallationRequest(supporting: modules) {
-            try await request.downloadAndInstall()
+    private static func ensureModelInstalled(for modules: [any SpeechModule]) async throws -> ModelState {
+        var status = await AssetInventory.status(forModules: modules)
+        if status == .installed { return .ready }
+        if status == .unsupported { return .unsupported }
+
+        // `.supported` means the language exists but its assets are not
+        // downloaded for this app yet. A nil request means the system has
+        // nothing queued, so there is no download to wait on.
+        if status == .supported {
+            if let request = try await AssetInventory.assetInstallationRequest(supporting: modules) {
+                try await request.downloadAndInstall()
+            }
         }
-        return await AssetInventory.status(forModules: modules) == .installed
+
+        // A download kicked off by us or already in flight elsewhere reports
+        // `.downloading`. Poll rather than treating that instant as failure.
+        let deadline = Date().addingTimeInterval(180)
+        while Date() < deadline {
+            status = await AssetInventory.status(forModules: modules)
+            switch status {
+            case .installed: return .ready
+            case .unsupported: return .unsupported
+            default: break
+            }
+            try await Task.sleep(for: .milliseconds(400))
+        }
+        return .notReady
     }
 
     /// Builds the analyzer and starts consuming the input stream.
@@ -79,12 +116,16 @@ actor Transcriber {
         let module = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
         transcriber = module
 
-        // Reserving the locale keeps the asset resident instead of being
-        // evicted between dictations.
+        // Reserve before checking status: reservation is what allocates the
+        // asset to this app, and `status(forModules:)` reports `.supported`
+        // rather than `.installed` until that happens — even when the system
+        // already lists the locale in `installedLocales`.
         _ = try? await AssetInventory.reserve(locale: locale)
 
-        guard try await Self.ensureModelInstalled(for: [module]) else {
-            throw TranscriberError.unsupportedLocale(locale.identifier)
+        switch try await Self.ensureModelInstalled(for: [module]) {
+        case .ready: break
+        case .unsupported: throw TranscriberError.unsupportedLocale(locale.identifier)
+        case .notReady: throw TranscriberError.modelNotReady(locale.identifier)
         }
 
         guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [module])
