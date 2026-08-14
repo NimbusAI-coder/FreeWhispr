@@ -10,6 +10,18 @@ SOURCES = $(shell find Sources -name '*.swift' -type f | LC_ALL=C sort)
 SDK     = $(shell xcrun --show-sdk-path)
 ARCH   ?= $(shell uname -m)
 
+# Sign with a stable identity when one exists, so macOS keeps treating
+# rebuilds as the same app and the Accessibility grant survives. Ad-hoc
+# signing ("-") changes the signature every build, which silently
+# invalidates the grant while System Settings still shows it as on.
+# Create one with: openssl + `security import` + add-trusted-cert
+# (see README), named "FreeWhispr Local Signing".
+SIGN_IDENTITY ?= $(shell security find-identity -v -p codesigning 2>/dev/null \
+	| grep -o '"FreeWhispr Local Signing"' | head -1 | tr -d '"')
+ifeq ($(SIGN_IDENTITY),)
+SIGN_IDENTITY = -
+endif
+
 .PHONY: all clean run install
 
 all: $(EXEC)
@@ -28,10 +40,13 @@ $(EXEC): $(SOURCES) Info.plist
 		-framework Speech \
 		$(SOURCES)
 	@cp Info.plist "$(CONTENTS)/Info.plist"
-	@codesign --force --deep --sign - \
+	@codesign --force --deep --sign "$(SIGN_IDENTITY)" \
 		--entitlements FreeWhispr.entitlements \
 		"$(APP_BUNDLE)" 2>/dev/null || \
-		codesign --force --deep --sign - "$(APP_BUNDLE)"
+		codesign --force --deep --sign "$(SIGN_IDENTITY)" "$(APP_BUNDLE)"
+	@if [ "$(SIGN_IDENTITY)" = "-" ]; then \
+		echo "note: ad-hoc signed; Accessibility must be re-granted after each rebuild"; \
+	fi
 	@echo "Built $(APP_BUNDLE)"
 
 run: all
