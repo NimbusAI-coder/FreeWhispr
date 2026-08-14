@@ -1,0 +1,218 @@
+import AppKit
+import Foundation
+
+@main
+enum FreeWhispr {
+    static func main() {
+        Settings.registerDefaults()
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)
+        app.run()
+    }
+}
+
+@available(macOS 26.0, *)
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+
+    private var statusItem: NSStatusItem?
+    private let hotkeys = HotkeyManager()
+    private lazy var controller = DictationController()
+    private var ollamaReachable = false
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        buildStatusItem()
+        wireController()
+        wireHotkeys()
+
+        if hotkeys.isTrusted {
+            hotkeys.start()
+        } else {
+            promptForAccessibility()
+        }
+
+        // Pull the speech model down now so the first dictation is not slow.
+        Task { await Transcriber.prewarm() }
+        refreshOllamaStatus()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        hotkeys.stop()
+    }
+
+    // MARK: - Wiring
+
+    private func wireController() {
+        controller.onStateChange = { [weak self] recording in
+            self?.updateIcon(recording: recording)
+        }
+        controller.onError = { [weak self] message in
+            self?.presentError(message)
+        }
+    }
+
+    private func wireHotkeys() {
+        hotkeys.onHoldStart = { [weak self] in self?.controller.start() }
+        hotkeys.onHoldStop = { [weak self] in self?.controller.stopAndPaste() }
+        hotkeys.onLatch = { [weak self] in self?.controller.setLatched(true) }
+        hotkeys.onCancel = { [weak self] in
+            self?.controller.cancel()
+            self?.hotkeys.noteRecordingEnded()
+        }
+    }
+
+    // MARK: - Status item
+
+    private func buildStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.image = NSImage(
+            systemSymbolName: "waveform",
+            accessibilityDescription: "FreeWhispr"
+        )
+        item.menu = buildMenu()
+        statusItem = item
+    }
+
+    private func updateIcon(recording: Bool) {
+        let symbol = recording ? "waveform.circle.fill" : "waveform"
+        statusItem?.button?.image = NSImage(
+            systemSymbolName: symbol,
+            accessibilityDescription: "FreeWhispr"
+        )
+        statusItem?.menu = buildMenu()
+    }
+
+    private func buildMenu() -> NSMenu {
+        let menu = NSMenu()
+
+        let toggle = NSMenuItem(
+            title: controller.isRecording ? "Stop Dictating" : "Start Dictating",
+            action: #selector(toggleDictation),
+            keyEquivalent: ""
+        )
+        toggle.target = self
+        menu.addItem(toggle)
+
+        menu.addItem(.separator())
+
+        let hint = NSMenuItem(title: "Hold fn to talk · ⌘ to latch · esc to cancel", action: nil, keyEquivalent: "")
+        hint.isEnabled = false
+        menu.addItem(hint)
+
+        if !hotkeys.isTrusted {
+            let warn = NSMenuItem(
+                title: "⚠ Grant Accessibility permission",
+                action: #selector(promptForAccessibility),
+                keyEquivalent: ""
+            )
+            warn.target = self
+            menu.addItem(warn)
+        }
+
+        menu.addItem(.separator())
+
+        let cleanup = NSMenuItem(
+            title: "Clean up with Ollama",
+            action: #selector(toggleCleanup),
+            keyEquivalent: ""
+        )
+        cleanup.target = self
+        cleanup.state = Settings.cleanupEnabled ? .on : .off
+        menu.addItem(cleanup)
+
+        let status = NSMenuItem(
+            title: ollamaReachable
+                ? "Ollama: connected (\(Settings.ollamaModel))"
+                : "Ollama: not running — using raw transcript",
+            action: nil,
+            keyEquivalent: ""
+        )
+        status.isEnabled = false
+        menu.addItem(status)
+
+        let recheck = NSMenuItem(
+            title: "Re-check Ollama",
+            action: #selector(refreshOllamaStatusAction),
+            keyEquivalent: ""
+        )
+        recheck.target = self
+        menu.addItem(recheck)
+
+        menu.addItem(.separator())
+
+        let privacy = NSMenuItem(
+            title: "Privacy: audio never leaves this Mac",
+            action: nil,
+            keyEquivalent: ""
+        )
+        privacy.isEnabled = false
+        menu.addItem(privacy)
+
+        menu.addItem(.separator())
+
+        let quit = NSMenuItem(title: "Quit FreeWhispr", action: #selector(quit), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+
+        return menu
+    }
+
+    // MARK: - Actions
+
+    @objc private func toggleDictation() {
+        controller.toggle()
+    }
+
+    @objc private func toggleCleanup() {
+        Settings.cleanupEnabled.toggle()
+        refreshOllamaStatus()
+    }
+
+    @objc private func refreshOllamaStatusAction() {
+        refreshOllamaStatus()
+    }
+
+    private func refreshOllamaStatus() {
+        Task { @MainActor in
+            self.ollamaReachable = await OllamaCleanup.isAvailable()
+            self.statusItem?.menu = self.buildMenu()
+        }
+    }
+
+    @objc private func promptForAccessibility() {
+        let granted = hotkeys.requestAccessibility()
+        if granted {
+            hotkeys.start()
+            statusItem?.menu = buildMenu()
+            return
+        }
+
+        // The tap can only be created once the user flips the switch, so poll
+        // briefly rather than making them relaunch.
+        Task { @MainActor in
+            for _ in 0..<120 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if self.hotkeys.isTrusted {
+                    self.hotkeys.start()
+                    self.statusItem?.menu = self.buildMenu()
+                    return
+                }
+            }
+        }
+    }
+
+    private func presentError(_ message: String) {
+        let alert = NSAlert()
+        alert.messageText = "FreeWhispr"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    @objc private func quit() {
+        NSApp.terminate(nil)
+    }
+}

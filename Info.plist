@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>FreeWhispr</string>
+    <key>CFBundleDisplayName</key>
+    <string>FreeWhispr</string>
+    <key>CFBundleIdentifier</key>
+    <string>local.freewhispr</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>FreeWhispr</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>26.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>FreeWhispr records your voice so it can be transcribed on-device.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>FreeWhispr uses on-device speech recognition to turn your voice into text. No audio leaves this Mac.</string>
+    <key>NSAccessibilityUsageDescription</key>
+    <string>FreeWhispr needs Accessibility access to detect its dictation hotkey and paste transcribed text into the app you are using.</string>
+</dict>
+</plist>
