@@ -14,6 +14,7 @@ actor Transcriber {
         case unavailable
         case unsupportedLocale(String)
         case modelNotReady(String)
+        case modelRestoring(String)
         case noCompatibleFormat
 
         var errorDescription: String? {
@@ -22,6 +23,12 @@ actor Transcriber {
                 return "On-device speech recognition is unavailable on this Mac."
             case .unsupportedLocale(let id):
                 return "Speech recognition does not support the locale \"\(id)\"."
+            case .modelRestoring(let id):
+                return """
+                    The \(id) speech model was unloaded by macOS and is being \
+                    restored in the background. This takes a few moments — try \
+                    again shortly. No need to restart FreeWhispr.
+                    """
             case .modelNotReady(let id):
                 return """
                     The \(id) speech model is not installed yet. macOS downloads \
@@ -76,6 +83,33 @@ actor Transcriber {
     ///   Generous at launch, where nobody is blocked; near-zero when starting a
     ///   dictation, because audio capture does not begin until this returns and
     ///   a long wait presents as a dead recording overlay.
+    /// Guards against stacking restores when several dictations fail in a row.
+    private static let restoreLock = NSLock()
+    nonisolated(unsafe) private static var restoreInFlight = false
+
+    /// Re-downloads the asset off the hot path, so a lapsed model repairs
+    /// itself without the user having to restart the app.
+    private static func beginBackgroundRestore(locale: Locale) {
+        restoreLock.lock()
+        if restoreInFlight {
+            restoreLock.unlock()
+            return
+        }
+        restoreInFlight = true
+        restoreLock.unlock()
+
+        Task.detached(priority: .utility) {
+            let module = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
+            _ = try? await AssetInventory.reserve(locale: locale)
+            let state = try? await ensureModelInstalled(for: [module], waitSeconds: 300)
+            Trace.write("restore: finished state=\(String(describing: state))")
+
+            restoreLock.lock()
+            restoreInFlight = false
+            restoreLock.unlock()
+        }
+    }
+
     private static func ensureModelInstalled(
         for modules: [any SpeechModule],
         waitSeconds: TimeInterval
@@ -138,9 +172,19 @@ actor Transcriber {
         // poll here shows up as an overlay that appears and hears nothing —
         // which is exactly what a 180s deadline here used to cause.
         switch try await Self.ensureModelInstalled(for: [module], waitSeconds: 4) {
-        case .ready: break
-        case .unsupported: throw TranscriberError.unsupportedLocale(locale.identifier)
-        case .notReady: throw TranscriberError.modelNotReady(locale.identifier)
+        case .ready:
+            break
+        case .unsupported:
+            throw TranscriberError.unsupportedLocale(locale.identifier)
+        case .notReady:
+            // The asset lapsed after launch. Only the long-wait path is allowed
+            // to download, and that path previously ran just once at startup —
+            // so every later dictation failed permanently and relaunching the
+            // app was the only cure. Kick off a restore in the background so
+            // the app heals itself instead of staying broken.
+            Trace.write("begin: model NOT ready — starting background restore")
+            Self.beginBackgroundRestore(locale: locale)
+            throw TranscriberError.modelRestoring(locale.identifier)
         }
         Trace.write("begin: model ready")
 

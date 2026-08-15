@@ -103,13 +103,18 @@ final class DictationController {
         let peak = capture.sessionPeak
         let device = capture.inputDeviceName
         let buffers = capture.bufferCount
+        let engineRan = capture.didStart
         capture.stop()
 
         // Ignore accidental taps that produced no meaningful audio.
         let duration = startedAt.map { Date().timeIntervalSince($0) } ?? 0
         startedAt = nil
 
-        Trace.write("stop: dur=\(String(format: "%.2f", duration))s buffers=\(buffers) peak=\(String(format: "%.5f", peak)) device=\(device)")
+        if engineRan {
+            Trace.write("stop: dur=\(String(format: "%.2f", duration))s buffers=\(buffers) peak=\(String(format: "%.5f", peak)) device=\(device)")
+        } else {
+            Trace.write("stop: dur=\(String(format: "%.2f", duration))s ENGINE NEVER STARTED (setup failed; no audio was captured)")
+        }
 
         guard duration > 0.35 else {
             Task { await transcriber.cancel() }

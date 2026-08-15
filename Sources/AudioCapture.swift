@@ -31,6 +31,12 @@ final class AudioCapture {
     /// signal; room tone alone clears it comfortably.
     static let silenceThreshold: Float = 0.0005
 
+    /// True once `start()` has actually brought the engine up this session.
+    /// Without this, a session that failed before the engine started reports
+    /// the *previous* session's buffer count and peak, which reads as healthy
+    /// audio on a run that never opened the microphone at all.
+    private(set) var didStart = false
+
     /// Number of buffers delivered by the tap this session. Zero means the tap
     /// never fired at all, which is a different fault from buffers of silence.
     private var _bufferCount = 0
@@ -101,9 +107,12 @@ final class AudioCapture {
 
         engine.prepare()
         try engine.start()
+        didStart = true
     }
 
     func stop() {
+        didStart = false
+
         if tapInstalled {
             engine.inputNode.removeTap(onBus: 0)
             tapInstalled = false
