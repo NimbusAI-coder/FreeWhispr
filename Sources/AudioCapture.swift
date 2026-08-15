@@ -31,6 +31,15 @@ final class AudioCapture {
     /// signal; room tone alone clears it comfortably.
     static let silenceThreshold: Float = 0.0005
 
+    /// Number of buffers delivered by the tap this session. Zero means the tap
+    /// never fired at all, which is a different fault from buffers of silence.
+    private var _bufferCount = 0
+    var bufferCount: Int {
+        os_unfair_lock_lock(&peakLock)
+        defer { os_unfair_lock_unlock(&peakLock) }
+        return _bufferCount
+    }
+
     /// Name of the device actually being recorded from, for error messages.
     var inputDeviceName: String {
         AVCaptureDevice.default(for: .audio)?.localizedName ?? "the default input"
@@ -50,6 +59,7 @@ final class AudioCapture {
 
         os_unfair_lock_lock(&peakLock)
         _sessionPeak = 0
+        _bufferCount = 0
         os_unfair_lock_unlock(&peakLock)
 
         // Discard the previous engine rather than reusing it; see the property
@@ -74,6 +84,11 @@ final class AudioCapture {
         input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
             guard let self else { return }
             self.onBuffer?(buffer)
+
+            os_unfair_lock_lock(&self.peakLock)
+            self._bufferCount += 1
+            os_unfair_lock_unlock(&self.peakLock)
+
             if let raw = Self.rawPeak(of: buffer) {
                 os_unfair_lock_lock(&self.peakLock)
                 self._sessionPeak = max(self._sessionPeak, raw)

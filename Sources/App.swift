@@ -23,13 +23,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var ollamaReachable = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Trace.rotateIfLarge()
         buildStatusItem()
         wireController()
         wireHotkeys()
 
+        Trace.write("launch: accessibilityTrusted=\(self.hotkeys.isTrusted)")
+
         if hotkeys.isTrusted {
             hotkeys.start()
+            Trace.write("launch: hotkey tap installed")
         } else {
+            Trace.write("launch: NOT trusted for Accessibility — hotkey will not fire")
             promptForAccessibility()
         }
 

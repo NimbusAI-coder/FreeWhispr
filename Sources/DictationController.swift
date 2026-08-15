@@ -2,6 +2,8 @@ import AppKit
 import AVFoundation
 import Foundation
 
+/// Session tracing goes to ~/Library/Logs/FreeWhispr.log — see Trace.swift.
+
 /// Orchestrates one dictation: capture -> on-device transcribe -> optional
 /// local cleanup -> paste.
 ///
@@ -46,16 +48,43 @@ final class DictationController {
 
         Task { @MainActor in
             do {
+                let auth = AVCaptureDevice.authorizationStatus(for: .audio)
+                Trace.write("start: micAuth=\(auth.rawValue) device=\(self.capture.inputDeviceName)")
+
                 guard await self.ensureMicrophoneAccess() else {
+                    Trace.write("start: microphone access denied")
                     self.fail("Microphone access denied. Grant it in System Settings › Privacy & Security › Microphone.")
                     return
                 }
 
-                try await self.transcriber.begin()
+                // Capture cannot start until setup finishes, so a stall here is
+                // invisible to the user: the overlay sits there hearing nothing.
+                // Bound it and report instead of hanging.
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    group.addTask { try await self.transcriber.begin() }
+                    group.addTask {
+                        try await Task.sleep(for: .seconds(8))
+                        throw NSError(
+                            domain: "FreeWhispr", code: 20,
+                            userInfo: [NSLocalizedDescriptionKey: """
+                                Timed out preparing the speech model. If macOS is \
+                                still downloading it, wait a moment and try again.
+                                """]
+                        )
+                    }
+                    try await group.next()
+                    group.cancelAll()
+                }
+                Trace.write("start: transcriber ready")
+
                 try self.capture.start()
+                let fmt = self.capture.inputFormat
+                Trace.write("start: engine running rate=\(fmt.sampleRate) ch=\(fmt.channelCount)")
+
                 sound("Tink")
                 self.watchForDeadInput()
             } catch {
+                Trace.write("start failed: \(error.localizedDescription)")
                 self.fail(error.localizedDescription)
             }
         }
@@ -73,11 +102,14 @@ final class DictationController {
         // Read the peak before stopping tears the session down.
         let peak = capture.sessionPeak
         let device = capture.inputDeviceName
+        let buffers = capture.bufferCount
         capture.stop()
 
         // Ignore accidental taps that produced no meaningful audio.
         let duration = startedAt.map { Date().timeIntervalSince($0) } ?? 0
         startedAt = nil
+
+        Trace.write("stop: dur=\(String(format: "%.2f", duration))s buffers=\(buffers) peak=\(String(format: "%.5f", peak)) device=\(device)")
 
         guard duration > 0.35 else {
             Task { await transcriber.cancel() }

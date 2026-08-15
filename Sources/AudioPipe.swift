@@ -18,6 +18,17 @@ final class AudioPipe: @unchecked Sendable {
     private var targetFormat: AVAudioFormat?
     private var sourceFormat: AVAudioFormat?
 
+    /// Diagnostics: buffers handed in, versus buffers that survived conversion
+    /// and were actually yielded to the analyzer. A gap between these means
+    /// audio is being dropped silently in `convertLocked`.
+    private(set) var fedCount = 0
+    private(set) var yieldedCount = 0
+    var counts: (fed: Int, yielded: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (fedCount, yieldedCount)
+    }
+
     /// Opens a fresh stream, discarding any previous one.
     func open(target: AVAudioFormat) -> AsyncStream<AnalyzerInput> {
         let (stream, cont) = AsyncStream<AnalyzerInput>.makeStream()
@@ -27,6 +38,8 @@ final class AudioPipe: @unchecked Sendable {
         targetFormat = target
         converter = nil
         sourceFormat = nil
+        fedCount = 0
+        yieldedCount = 0
         lock.unlock()
         return stream
     }
@@ -35,9 +48,11 @@ final class AudioPipe: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
+        fedCount += 1
         guard let continuation, let target = targetFormat else { return }
         guard let converted = convertLocked(buffer, to: target) else { return }
         continuation.yield(AnalyzerInput(buffer: converted))
+        yieldedCount += 1
     }
 
     func close() {

@@ -56,7 +56,9 @@ actor Transcriber {
         // Same ordering as `begin()`: without reserving first, the asset check
         // reports `.supported` forever and the model is never fetched.
         _ = try? await AssetInventory.reserve(locale: supported)
-        _ = try? await Self.ensureModelInstalled(for: [module])
+        Trace.write("prewarm: reserved \(supported.identifier), fetching model if needed")
+        let state = try? await Self.ensureModelInstalled(for: [module], waitSeconds: 300)
+        Trace.write("prewarm: done state=\(String(describing: state))")
     }
 
     /// Downloads the language asset if the system does not have it yet.
@@ -70,7 +72,14 @@ actor Transcriber {
         case notReady
     }
 
-    private static func ensureModelInstalled(for modules: [any SpeechModule]) async throws -> ModelState {
+    /// - Parameter waitSeconds: how long to wait for an in-flight download.
+    ///   Generous at launch, where nobody is blocked; near-zero when starting a
+    ///   dictation, because audio capture does not begin until this returns and
+    ///   a long wait presents as a dead recording overlay.
+    private static func ensureModelInstalled(
+        for modules: [any SpeechModule],
+        waitSeconds: TimeInterval
+    ) async throws -> ModelState {
         var status = await AssetInventory.status(forModules: modules)
         if status == .installed { return .ready }
         if status == .unsupported { return .unsupported }
@@ -78,7 +87,8 @@ actor Transcriber {
         // `.supported` means the language exists but its assets are not
         // downloaded for this app yet. A nil request means the system has
         // nothing queued, so there is no download to wait on.
-        if status == .supported {
+        // Downloading can take minutes, so only ever do it off the hot path.
+        if status == .supported, waitSeconds > 30 {
             if let request = try await AssetInventory.assetInstallationRequest(supporting: modules) {
                 try await request.downloadAndInstall()
             }
@@ -86,7 +96,7 @@ actor Transcriber {
 
         // A download kicked off by us or already in flight elsewhere reports
         // `.downloading`. Poll rather than treating that instant as failure.
-        let deadline = Date().addingTimeInterval(180)
+        let deadline = Date().addingTimeInterval(waitSeconds)
         while Date() < deadline {
             status = await AssetInventory.status(forModules: modules)
             switch status {
@@ -106,10 +116,12 @@ actor Transcriber {
 
         guard SpeechTranscriber.isAvailable else { throw TranscriberError.unavailable }
 
+        Trace.write("begin: resolving locale")
         let requested = Locale(identifier: Settings.localeIdentifier)
         guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: requested) else {
             throw TranscriberError.unsupportedLocale(requested.identifier)
         }
+        Trace.write("begin: locale=\(locale.identifier), reserving")
 
         // Progressive preset streams partial results while speaking, so the
         // final text is ready almost immediately after the key is released.
@@ -122,11 +134,15 @@ actor Transcriber {
         // already lists the locale in `installedLocales`.
         _ = try? await AssetInventory.reserve(locale: locale)
 
-        switch try await Self.ensureModelInstalled(for: [module]) {
+        // Short wait only. Recording cannot start until this returns, so a long
+        // poll here shows up as an overlay that appears and hears nothing —
+        // which is exactly what a 180s deadline here used to cause.
+        switch try await Self.ensureModelInstalled(for: [module], waitSeconds: 4) {
         case .ready: break
         case .unsupported: throw TranscriberError.unsupportedLocale(locale.identifier)
         case .notReady: throw TranscriberError.modelNotReady(locale.identifier)
         }
+        Trace.write("begin: model ready")
 
         guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [module])
         else { throw TranscriberError.noCompatibleFormat }
@@ -188,11 +204,29 @@ actor Transcriber {
     func finish() async -> String {
         pipe.close()
 
+        let counts = pipe.counts
+
+        var finalizeError = "none"
         if let analyzer {
-            try? await analyzer.finalizeAndFinishThroughEndOfInput()
+            do {
+                try await analyzer.finalizeAndFinishThroughEndOfInput()
+            } catch {
+                finalizeError = error.localizedDescription
+            }
         }
 
         let text = await collectTask?.value ?? finalizedText
+
+        // The discriminator: volatile partials arriving while finals do not
+        // means recognition worked and finalization is at fault. Neither
+        // arriving means audio never reached the analyzer. Lengths only —
+        // transcript content is never written to the trace.
+        Trace.write(
+            "finish: fed=\(counts.fed) yielded=\(counts.yielded) "
+            + "finalChars=\(text.count) volatileChars=\(volatileText.count) "
+            + "finalizeError=\(finalizeError)"
+        )
+
         await reset()
 
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
