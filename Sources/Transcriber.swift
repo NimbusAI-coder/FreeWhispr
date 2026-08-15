@@ -237,6 +237,19 @@ actor Transcriber {
         if status == .installed { return .ready }
         if status == .unsupported { return .unsupported }
 
+        // Before believing "not installed", drop this process's retained model
+        // state and ask again. The in-process view has been observed going
+        // stale while the system's is healthy — a fresh process sees the same
+        // model installed and downloadable in under a second. If releasing the
+        // retention refreshes the view, this recovers instantly and no restart
+        // is needed.
+        await SpeechModels.endRetention()
+        status = await AssetInventory.status(forModules: modules)
+        if status == .installed {
+            Trace.write("recovered: endRetention() refreshed a stale in-process model view")
+            return .ready
+        }
+
         // `.supported` means the language exists but its assets are not
         // downloaded for this app yet. A nil request means the system has
         // nothing queued, so there is no download to wait on.
