@@ -81,6 +81,10 @@ final class DictationController {
 
         generation += 1
         let gen = generation
+        // This session has not minted a token yet. Leaving the previous
+        // session's token here let an early teardown (esc during setup)
+        // cancel the PREVIOUS session's still-running finish.
+        sessionToken = 0
         isRecording = true
         startedAt = Date()
         onStateChange?(true)
@@ -303,7 +307,11 @@ final class DictationController {
         startedAt = nil
         onStateChange?(false)
         capture.stop()
-        Task { await transcriber.cancel(session: token) }
+        // token == 0 means this session never minted one — there is nothing of
+        // ours to cancel, and the previous session's finish must be left alone.
+        if token != 0 {
+            Task { await transcriber.cancel(session: token) }
+        }
         overlay.hide()
     }
 

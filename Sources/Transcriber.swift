@@ -259,17 +259,25 @@ actor Transcriber {
         epoch += 1
         let my = epoch
 
-        // Take ownership: tear down whatever the previous session left behind.
+        // Take ownership. The shared slots are cleared synchronously — while
+        // ownership is still certain — and only then is the captured old
+        // analyzer awaited. Awaiting first opened a reentrancy window: this
+        // invocation could wedge in the XPC call, be superseded by a newer
+        // begin(), and then resume to wipe the LIVE session's collector and
+        // text. The rule everywhere in this actor: never mutate shared state
+        // after an await without re-proving ownership.
         pipe.close()
-        if let old = analyzer {
-            await old.cancelAndFinishNow()
-        }
-        collectTask?.cancel()
+        let oldEngine = analyzer
+        let oldCollector = collectTask
         analyzer = nil
         transcriber = nil
         collectTask = nil
         finalizedText = ""
         volatileText = ""
+        oldCollector?.cancel()
+        if let oldEngine {
+            await oldEngine.cancelAndFinishNow()
+        }
         try checkEpoch(my)
 
         guard SpeechTranscriber.isAvailable else { throw TranscriberError.unavailable }
@@ -472,12 +480,18 @@ actor Transcriber {
             Trace.write("cancel: stale session \(session) ignored (current is \(epoch))")
             return
         }
+        // Capture-then-clear before the await: a cancel suspended in the XPC
+        // call used to resume after a newer begin() and kill the NEW session's
+        // collector. Ownership is proven at entry, so clearing synchronously
+        // and awaiting only captured locals is safe against any interleaving.
         pipe.close()
-        if let analyzer {
-            await analyzer.cancelAndFinishNow()
-        }
-        collectTask?.cancel()
+        let engine = analyzer
+        let collector = collectTask
         resetIfCurrent(session)
+        collector?.cancel()
+        if let engine {
+            await engine.cancelAndFinishNow()
+        }
     }
 
     /// Clears the shared slots only when `session` still owns them.
