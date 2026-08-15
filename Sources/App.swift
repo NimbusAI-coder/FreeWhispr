@@ -54,6 +54,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { _ in
             Task { await Transcriber.healthCheck(trigger: "wake") }
         }
+
+        // Last-resort self-heal. Observed in the wild: after long uptime the
+        // process's connection to the macOS speech service goes stale — every
+        // in-process restore reports the model missing while a fresh process
+        // sees it installed. Nothing inside the process can repair that, so
+        // once restores fail repeatedly, restart the app. Rate-limited so a
+        // genuine outage (no network for hours) cannot cause a relaunch loop.
+        Transcriber.onRestoreFailureStreak = { [weak self] streak in
+            Task { @MainActor in self?.recoverFromStuckSpeechService(streak: streak) }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -236,6 +246,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.alertStyle = .warning
         alert.addButton(withTitle: "OK")
         alert.runModal()
+    }
+
+    private func recoverFromStuckSpeechService(streak: Int) {
+        guard streak >= 3, !controller.isRecording else { return }
+
+        let key = "last_auto_relaunch"
+        let last = UserDefaults.standard.double(forKey: key)
+        let now = Date().timeIntervalSince1970
+        guard now - last > 3600 else { return }
+        UserDefaults.standard.set(now, forKey: key)
+
+        Trace.write("relaunch: restore failed \(streak)× in-process — speech service connection presumed stale, restarting")
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        task.arguments = ["-n", Bundle.main.bundlePath]
+        try? task.run()
+        NSApp.terminate(nil)
     }
 
     @objc private func quit() {

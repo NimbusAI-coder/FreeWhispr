@@ -40,9 +40,10 @@ actor Transcriber {
             case .modelRepairFailing(let id, let attempts):
                 return """
                     Restoring the \(id) speech model has failed \(attempts) times \
-                    in a row. This usually means no network connection or low disk \
-                    space. FreeWhispr keeps retrying in the background; dictation \
-                    will work again once a download succeeds.
+                    in a row. Causes: no network, low disk space, or a stale \
+                    connection to the macOS speech service inside this process. \
+                    FreeWhispr keeps retrying and will restart itself shortly if \
+                    the failures continue — dictation returns automatically.
                     """
             case .reservationFailed(let underlying):
                 return """
@@ -167,6 +168,10 @@ actor Transcriber {
         }
     }
 
+    /// Notified with the failure streak after each failed restore, so the app
+    /// layer can escalate. Set once at launch.
+    nonisolated(unsafe) static var onRestoreFailureStreak: (@Sendable (Int) -> Void)?
+
     /// Synchronous so the lock is never held from an async context.
     private static func noteRestoreOutcome(ready: Bool) {
         restoreLock.lock()
@@ -175,8 +180,13 @@ actor Transcriber {
         } else {
             consecutiveRestoreFailures += 1
         }
+        let streak = consecutiveRestoreFailures
         restoreInFlight = false
         restoreLock.unlock()
+
+        if !ready {
+            onRestoreFailureStreak?(streak)
+        }
     }
 
     /// Proactive watchdog. macOS may unload the speech asset at any time —
