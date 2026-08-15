@@ -4,28 +4,56 @@ import Foundation
 /// Puts text into the frontmost app by writing the pasteboard and synthesizing
 /// Cmd-V. This is the only reason FreeWhispr ever touches the pasteboard, and the
 /// previous contents are put back afterwards.
+@MainActor
 enum Paster {
 
     private static let transientType = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
+
+    /// The user's true pre-dictation clipboard while a restore is pending.
+    /// A chained paste arriving before the previous restore fires must carry
+    /// this forward — snapshotting at that moment would capture the previous
+    /// *transcript* and "restore" it over the user's real clipboard.
+    private static var pendingSaved: [Item]?
+
+    /// changeCount of the most recent write made by us, so a skipped restore
+    /// can tell "a newer dictation pasted" from "the user copied something".
+    private static var lastOwnCount = -1
 
     static func paste(_ text: String) {
         guard !text.isEmpty else { return }
 
         let pasteboard = NSPasteboard.general
-        let saved = snapshot(of: pasteboard)
+        let restoring = Settings.restoreClipboard
+        let saved = restoring ? (pendingSaved ?? snapshot(of: pasteboard)) : []
 
         pasteboard.clearContents()
         // Marking the item transient asks clipboard managers not to record it,
         // so dictations do not pile up in clipboard history.
         pasteboard.setData(Data(), forType: transientType)
         pasteboard.setString(text, forType: .string)
+        let myCount = pasteboard.changeCount
 
         sendCommandV()
 
-        guard Settings.restoreClipboard else { return }
+        guard restoring else {
+            pendingSaved = nil
+            return
+        }
+        lastOwnCount = myCount
+        pendingSaved = saved
 
         // Give the target app time to read the pasteboard before restoring.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            // Restore only while still owning the pasteboard. A restore firing
+            // after a newer dictation's paste would hand the target app the
+            // pre-dictation clipboard instead of the words just dictated.
+            guard pasteboard.changeCount == myCount else {
+                // If the newer write wasn't ours, the user copied something —
+                // the saved chain is obsolete and must not resurface later.
+                if pasteboard.changeCount != lastOwnCount { pendingSaved = nil }
+                return
+            }
+            pendingSaved = nil
             restore(saved, to: pasteboard)
         }
     }
