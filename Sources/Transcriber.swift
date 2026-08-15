@@ -15,6 +15,8 @@ actor Transcriber {
         case unsupportedLocale(String)
         case modelNotReady(String)
         case modelRestoring(String)
+        case modelRepairFailing(String, Int)
+        case reservationFailed(String)
         case noCompatibleFormat
 
         var errorDescription: String? {
@@ -34,6 +36,18 @@ actor Transcriber {
                     The \(id) speech model is not installed yet. macOS downloads \
                     it on first use, which needs a network connection once. \
                     Check your connection and try again in a moment.
+                    """
+            case .modelRepairFailing(let id, let attempts):
+                return """
+                    Restoring the \(id) speech model has failed \(attempts) times \
+                    in a row. This usually means no network connection or low disk \
+                    space. FreeWhispr keeps retrying in the background; dictation \
+                    will work again once a download succeeds.
+                    """
+            case .reservationFailed(let underlying):
+                return """
+                    macOS refused to allocate the speech model to FreeWhispr \
+                    (\(underlying)). Try again; if this persists, relaunch the app.
                     """
             case .noCompatibleFormat:
                 return "Could not negotiate an audio format with the speech analyzer."
@@ -62,7 +76,7 @@ actor Transcriber {
         let module = SpeechTranscriber(locale: supported, preset: .progressiveTranscription)
         // Same ordering as `begin()`: without reserving first, the asset check
         // reports `.supported` forever and the model is never fetched.
-        _ = try? await AssetInventory.reserve(locale: supported)
+        try? await Self.reserveTracked(locale: supported)
         Trace.write("prewarm: reserved \(supported.identifier), fetching model if needed")
         let state = try? await Self.ensureModelInstalled(for: [module], waitSeconds: 300)
         Trace.write("prewarm: done state=\(String(describing: state))")
@@ -83,9 +97,49 @@ actor Transcriber {
     ///   Generous at launch, where nobody is blocked; near-zero when starting a
     ///   dictation, because audio capture does not begin until this returns and
     ///   a long wait presents as a dead recording overlay.
-    /// Guards against stacking restores when several dictations fail in a row.
+    /// Guards against stacking restores when several dictations fail in a row,
+    /// and tracks whether restores are actually succeeding — a restore that
+    /// fails forever must escalate, not loop behind an optimistic message.
     private static let restoreLock = NSLock()
     nonisolated(unsafe) private static var restoreInFlight = false
+    nonisolated(unsafe) private static var consecutiveRestoreFailures = 0
+
+    static func restoreFailureCount() -> Int {
+        restoreLock.lock()
+        defer { restoreLock.unlock() }
+        return consecutiveRestoreFailures
+    }
+
+    /// One line for the menu bar when the model is in trouble, nil when healthy.
+    static func healthWarning() -> String? {
+        let failures = restoreFailureCount()
+        guard failures > 0 else { return nil }
+        return "⚠ Speech model download failing (\(failures)×) — check network"
+    }
+
+    /// Reserving is what allocates the asset to this app; without it the
+    /// inventory never reports `.installed`. Failures used to be swallowed
+    /// with `try?`, which turned "reservation limit reached" (the system
+    /// allows 5) into an endless, misdiagnosed "restoring…" loop. Recover by
+    /// releasing any reservation this app holds for *other* locales, retry
+    /// once, and surface a real error if it still fails.
+    private static func reserveTracked(locale: Locale) async throws {
+        do {
+            _ = try await AssetInventory.reserve(locale: locale)
+        } catch {
+            Trace.write("reserve: threw \(error.localizedDescription) — releasing other locales and retrying")
+            for held in await AssetInventory.reservedLocales where held.identifier != locale.identifier {
+                _ = await AssetInventory.release(reservedLocale: held)
+                Trace.write("reserve: released \(held.identifier)")
+            }
+            do {
+                _ = try await AssetInventory.reserve(locale: locale)
+            } catch {
+                Trace.write("reserve: retry FAILED: \(error.localizedDescription)")
+                throw TranscriberError.reservationFailed(error.localizedDescription)
+            }
+        }
+    }
 
     /// Re-downloads the asset off the hot path, so a lapsed model repairs
     /// itself without the user having to restart the app.
@@ -100,14 +154,41 @@ actor Transcriber {
 
         Task.detached(priority: .utility) {
             let module = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
-            _ = try? await AssetInventory.reserve(locale: locale)
+            try? await reserveTracked(locale: locale)
             let state = try? await ensureModelInstalled(for: [module], waitSeconds: 300)
             Trace.write("restore: finished state=\(String(describing: state))")
-
-            restoreLock.lock()
-            restoreInFlight = false
-            restoreLock.unlock()
+            noteRestoreOutcome(ready: state == .ready)
         }
+    }
+
+    /// Synchronous so the lock is never held from an async context.
+    private static func noteRestoreOutcome(ready: Bool) {
+        restoreLock.lock()
+        if ready {
+            consecutiveRestoreFailures = 0
+        } else {
+            consecutiveRestoreFailures += 1
+        }
+        restoreInFlight = false
+        restoreLock.unlock()
+    }
+
+    /// Proactive watchdog. macOS may unload the speech asset at any time —
+    /// after sleep, under disk pressure, or on its own schedule — and without
+    /// this the user only finds out mid-dictation. Called periodically and on
+    /// wake so a lapsed model is restored *before* the next dictation needs
+    /// it. Silent when healthy; logs only when repair work actually happens.
+    static func healthCheck(trigger: String) async {
+        guard SpeechTranscriber.isAvailable else { return }
+        let requested = Locale(identifier: Settings.localeIdentifier)
+        guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: requested)
+        else { return }
+
+        let module = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
+        if await AssetInventory.status(forModules: [module]) == .installed { return }
+
+        Trace.write("health(\(trigger)): model not installed — repairing")
+        beginBackgroundRestore(locale: locale)
     }
 
     private static func ensureModelInstalled(
@@ -166,7 +247,7 @@ actor Transcriber {
         // asset to this app, and `status(forModules:)` reports `.supported`
         // rather than `.installed` until that happens — even when the system
         // already lists the locale in `installedLocales`.
-        _ = try? await AssetInventory.reserve(locale: locale)
+        try await Self.reserveTracked(locale: locale)
 
         // Short wait only. Recording cannot start until this returns, so a long
         // poll here shows up as an overlay that appears and hears nothing —
@@ -182,8 +263,14 @@ actor Transcriber {
             // so every later dictation failed permanently and relaunching the
             // app was the only cure. Kick off a restore in the background so
             // the app heals itself instead of staying broken.
-            Trace.write("begin: model NOT ready — starting background restore")
+            let priorFailures = Self.restoreFailureCount()
+            Trace.write("begin: model NOT ready — starting background restore (prior failures: \(priorFailures))")
             Self.beginBackgroundRestore(locale: locale)
+            // "Try again shortly" is a lie once restores keep failing. After
+            // two failed attempts, tell the user what is actually wrong.
+            if priorFailures >= 2 {
+                throw TranscriberError.modelRepairFailing(locale.identifier, priorFailures)
+            }
             throw TranscriberError.modelRestoring(locale.identifier)
         }
         Trace.write("begin: model ready")
@@ -256,6 +343,10 @@ actor Transcriber {
                 try await analyzer.finalizeAndFinishThroughEndOfInput()
             } catch {
                 finalizeError = error.localizedDescription
+                // A failed finalize can leave the results stream open forever,
+                // which would wedge the collectTask await below. Force the
+                // analyzer down so the stream is guaranteed to terminate.
+                await analyzer.cancelAndFinishNow()
             }
         }
 
@@ -274,6 +365,13 @@ actor Transcriber {
         await reset()
 
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Best-effort transcript for stall recovery: everything finalized plus the
+    /// current volatile tail. Only used when the normal finish path has already
+    /// wedged — losing a few words beats losing the whole dictation.
+    func snapshot() -> String {
+        (finalizedText + volatileText).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Drops the session without producing text.

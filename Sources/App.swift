@@ -21,6 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let hotkeys = HotkeyManager()
     private lazy var controller = DictationController()
     private var ollamaReachable = false
+    private var healthTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Trace.rotateIfLarge()
@@ -41,6 +42,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Pull the speech model down now so the first dictation is not slow.
         Task { await Transcriber.prewarm() }
         refreshOllamaStatus()
+
+        // Keep the model alive after launch. macOS can unload the speech asset
+        // at any time; re-check periodically and after every wake from sleep so
+        // it is repaired before the next dictation instead of during it.
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 15 * 60, repeats: true) { _ in
+            Task { await Transcriber.healthCheck(trigger: "timer") }
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { _ in
+            Task { await Transcriber.healthCheck(trigger: "wake") }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -114,6 +127,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             warn.target = self
             menu.addItem(warn)
+        }
+
+        // A background model restore that keeps failing must be visible
+        // somewhere the user can find it, not only in the trace log.
+        if let health = Transcriber.healthWarning() {
+            let item = NSMenuItem(title: health, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
         }
 
         menu.addItem(.separator())

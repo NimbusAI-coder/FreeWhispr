@@ -55,13 +55,23 @@ final class AudioCapture {
     var onBuffer: ((AVAudioPCMBuffer) -> Void)?
     /// Rough 0...1 input level, for the recording indicator.
     var onLevel: ((Float) -> Void)?
+    /// Fired when the engine's audio configuration changes underneath it
+    /// (device switch, AirPods connecting, display unplugged). The engine is
+    /// effectively dead at that point; the owner should rebuild or stop.
+    var onConfigurationChange: (() -> Void)?
+
+    private var configObserver: NSObjectProtocol?
 
     var inputFormat: AVAudioFormat {
         engine.inputNode.outputFormat(forBus: 0)
     }
 
     func start() throws {
-        guard !engine.isRunning else { return }
+        // No early-return when the engine is already running: a leaked engine
+        // from an orphaned session must be torn down and replaced, never
+        // silently adopted — adopting it skips the counter reset below and
+        // reuses exactly the stale binding this class exists to avoid.
+        stop()
 
         os_unfair_lock_lock(&peakLock)
         _sessionPeak = 0
@@ -71,10 +81,6 @@ final class AudioCapture {
         // Discard the previous engine rather than reusing it; see the property
         // comment. Cheap to construct, and the only reliable way to pick up the
         // input device that is current *now*.
-        if tapInstalled {
-            engine.inputNode.removeTap(onBus: 0)
-            tapInstalled = false
-        }
         engine = AVAudioEngine()
 
         let input = engine.inputNode
@@ -108,11 +114,25 @@ final class AudioCapture {
         engine.prepare()
         try engine.start()
         didStart = true
+
+        // Watch this specific engine for configuration changes; a device
+        // switch mid-session kills it silently otherwise.
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: nil
+        ) { [weak self] _ in
+            self?.onConfigurationChange?()
+        }
     }
 
     func stop() {
         didStart = false
 
+        if let observer = configObserver {
+            NotificationCenter.default.removeObserver(observer)
+            configObserver = nil
+        }
         if tapInstalled {
             engine.inputNode.removeTap(onBus: 0)
             tapInstalled = false
