@@ -109,6 +109,38 @@ defaults write local.freewhispr locale_identifier en_US
 
 ## Troubleshooting
 
+**Start with the log.** Every session is traced to
+`~/Library/Logs/FreeWhispr.log`:
+
+```bash
+cat ~/Library/Logs/FreeWhispr.log
+```
+
+A healthy dictation looks like this:
+
+```
+begin: model ready
+start: engine running rate=48000.0 ch=1
+stop: dur=3.05s buffers=26 peak=0.11885 device=MacBook Pro Microphone
+finish: fed=26 yielded=26 finalChars=28 volatileChars=27 finalizeError=none
+```
+
+Read it as a pipeline, and the first line that looks wrong is the fault:
+
+- **Missing `engine running`** — setup stalled, so the microphone was never
+  opened. The overlay appears and hears nothing.
+- **`buffers=0`** — the audio tap never fired.
+- **`buffers>0` but `peak=0.00000`** — audio is flowing but is digital silence:
+  a revoked microphone grant, the wrong input device, or a hardware mute.
+  macOS reports a revoked mic by feeding zeroed buffers, not by failing.
+- **`fed` > `yielded`** — audio is being dropped in format conversion.
+- **`volatileChars>0` but `finalChars=0`** — speech was recognised but never
+  finalised.
+
+Only mechanical facts are recorded — device names, buffer counts, audio
+levels, error text. Transcript content is never written. The file rotates
+at 512KB.
+
 **`fn` does nothing, but Accessibility is already switched on.**
 
 This is the one everybody hits. FreeWhispr is ad-hoc signed, and macOS ties an
