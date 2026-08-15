@@ -24,6 +24,12 @@ enum Paster {
 
         let pasteboard = NSPasteboard.general
         let restoring = Settings.restoreClipboard
+        // Adopt the saved-clipboard chain only if nothing foreign wrote since
+        // our last paste — otherwise the user copied something in the gap
+        // between two chained pastes, and that copy (not the older saved
+        // state) is what must survive.
+        let chainValid = pasteboard.changeCount == lastOwnCount
+        if !chainValid { pendingSaved = nil }
         let saved = restoring ? (pendingSaved ?? snapshot(of: pasteboard)) : []
 
         pasteboard.clearContents()
