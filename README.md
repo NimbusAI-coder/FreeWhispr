@@ -122,7 +122,7 @@ A healthy dictation looks like this:
 begin: model ready
 start: engine running rate=48000.0 ch=1
 stop: dur=3.05s buffers=26 peak=0.11885 device=MacBook Pro Microphone
-finish: fed=26 yielded=26 finalChars=28 volatileChars=27 finalizeError=none
+finish: session=1 fed=26 yielded=26 finalChars=28 volatileChars=27 finalizeError=none
 ```
 
 Read it as a pipeline, and the first line that looks wrong is the fault:
