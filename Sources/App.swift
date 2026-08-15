@@ -251,10 +251,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func recoverFromStuckSpeechService(streak: Int) {
         guard streak >= 3, !controller.isRecording else { return }
 
+        // Observed recurring ~70 minutes after launch, so an hourly limit
+        // would have blocked the very recovery it exists to allow. Ten
+        // minutes still makes a relaunch loop impossible (a genuine outage
+        // retries at most six times an hour) while letting a real recurrence
+        // heal promptly.
         let key = "last_auto_relaunch"
         let last = UserDefaults.standard.double(forKey: key)
         let now = Date().timeIntervalSince1970
-        guard now - last > 3600 else { return }
+        guard now - last > 600 else {
+            Trace.write("relaunch: suppressed (last was \(Int(now - last))s ago)")
+            return
+        }
         UserDefaults.standard.set(now, forKey: key)
 
         Trace.write("relaunch: restore failed \(streak)× in-process — speech service connection presumed stale, restarting")

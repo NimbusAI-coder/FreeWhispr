@@ -172,6 +172,28 @@ actor Transcriber {
     /// layer can escalate. Set once at launch.
     nonisolated(unsafe) static var onRestoreFailureStreak: (@Sendable (Int) -> Void)?
 
+    /// Consecutive dictations that found the model missing. This is the *fast*
+    /// stale-service signal: a background restore takes 300s to report failure,
+    /// so waiting on that streak left the user pressing fn into a wall for
+    /// fifteen minutes. Failed dictations arrive in seconds.
+    nonisolated(unsafe) private static var consecutiveNotReady = 0
+
+    private static func noteNotReady() -> Int {
+        restoreLock.lock()
+        consecutiveNotReady += 1
+        let streak = consecutiveNotReady
+        restoreLock.unlock()
+        return streak
+    }
+
+    private static func noteModelReady() {
+        restoreLock.lock()
+        let had = consecutiveNotReady
+        consecutiveNotReady = 0
+        restoreLock.unlock()
+        if had > 0 { Trace.write("model ready again after \(had) failed attempt(s)") }
+    }
+
     /// Synchronous so the lock is never held from an async context.
     private static func noteRestoreOutcome(ready: Bool) {
         restoreLock.lock()
@@ -316,7 +338,7 @@ actor Transcriber {
         // which is exactly what a 180s deadline here used to cause.
         switch try await Self.ensureModelInstalled(for: [module], waitSeconds: 4) {
         case .ready:
-            break
+            Self.noteModelReady()
         case .unsupported:
             throw TranscriberError.unsupportedLocale(locale.identifier)
         case .notReady:
@@ -326,10 +348,18 @@ actor Transcriber {
             // app was the only cure. Kick off a restore in the background so
             // the app heals itself instead of staying broken.
             let priorFailures = Self.restoreFailureCount()
-            Trace.write("begin: model NOT ready — starting background restore (prior failures: \(priorFailures))")
+            let streak = Self.noteNotReady()
+            Trace.write("begin: model NOT ready — starting background restore (failed dictations: \(streak), failed restores: \(priorFailures))")
             Self.beginBackgroundRestore(locale: locale)
-            // "Try again shortly" is a lie once restores keep failing. After
-            // two failed attempts, tell the user what is actually wrong.
+
+            // The system disagreeing with us across several dictations in a
+            // row is the stale-service signature: a fresh process sees the
+            // model installed while this one cannot. Escalate on the fast
+            // signal rather than waiting ~15 minutes for restore streaks.
+            if streak >= 3 {
+                Self.onRestoreFailureStreak?(streak)
+                throw TranscriberError.modelRepairFailing(locale.identifier, streak)
+            }
             if priorFailures >= 2 {
                 throw TranscriberError.modelRepairFailing(locale.identifier, priorFailures)
             }
