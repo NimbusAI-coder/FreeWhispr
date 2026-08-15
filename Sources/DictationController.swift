@@ -38,6 +38,16 @@ final class DictationController {
     /// The in-flight setup for the current session, so teardown can cancel it.
     private var setupTask: Task<Void, Never>?
 
+    /// Token minted by the Transcriber for the current session. All finish/
+    /// cancel calls pass it, so a stale cleanup task firing late can never
+    /// tear down a newer session's transcription.
+    private var sessionToken = 0
+
+    /// The previous session's finish-and-paste, if still running. A new
+    /// session's setup awaits it (bounded) before calling begin(), so a
+    /// chained dictation cannot interleave begin() with an in-flight finish().
+    private var completionTask: Task<Void, Never>?
+
     /// Set by AppDelegate so the menu bar can reflect state.
     var onStateChange: ((Bool) -> Void)?
     var onError: ((String) -> Void)?
@@ -64,6 +74,11 @@ final class DictationController {
     func start(latched: Bool = false) {
         guard !isRecording else { return }
 
+        // A setup task from an earlier, already-ended session may still be in
+        // flight; cancel it so its begin() gets superseded cleanly rather than
+        // racing ours (the Transcriber's epoch fences it either way).
+        setupTask?.cancel()
+
         generation += 1
         let gen = generation
         isRecording = true
@@ -81,29 +96,41 @@ final class DictationController {
                     self.fail("Microphone access denied. Grant it in System Settings › Privacy & Security › Microphone.", gen: gen)
                     return
                 }
-                guard self.isLive(gen) else {
-                    await self.transcriber.cancel()
-                    return
+                guard self.isLive(gen) else { return }
+
+                // Serialize with the previous session's finish-and-paste. The
+                // Transcriber actor is reentrant; without this, a chained
+                // dictation's begin() could interleave with the previous
+                // finish() and destroy its state mid-flight. Bounded so a
+                // wedged completion cannot block dictating forever — past the
+                // bound, the epoch fence is the backstop.
+                if let previous = self.completionTask {
+                    _ = await Self.race(previous, seconds: 12)
                 }
+                guard self.isLive(gen) else { return }
 
                 // Bound setup with a race, not a task group: a group waits for
                 // its cancelled children before rethrowing, and the Speech
                 // framework's XPC calls do not promise prompt cancellation —
                 // so a group "timeout" could still hang for the whole stall.
                 let beginTask = Task { try await self.transcriber.begin() }
+                let token: Int
                 switch await Self.race(beginTask, seconds: 8) {
-                case .success:
-                    break
+                case .success(let minted):
+                    token = minted
                 case .failure(let error):
                     throw error
                 case nil:
                     Trace.write("start: begin() STALLED past 8s — abandoning it")
                     beginTask.cancel()
-                    // If the wedged call ever does return, tear down whatever
-                    // half-built session it produced.
+                    // If the wedged call ever does return, tear down the
+                    // session it minted — and only that one. An unscoped
+                    // cancel here used to kill whichever session was live
+                    // minutes later when the wedged XPC finally returned.
                     Task {
-                        _ = try? await beginTask.value
-                        await self.transcriber.cancel()
+                        if let minted = try? await beginTask.value {
+                            await self.transcriber.cancel(session: minted)
+                        }
                     }
                     Task { await Transcriber.healthCheck(trigger: "begin-stall") }
                     throw NSError(
@@ -115,13 +142,14 @@ final class DictationController {
                             """]
                     )
                 }
-                Trace.write("start: transcriber ready")
+                self.sessionToken = token
+                Trace.write("start: transcriber ready (session \(token))")
 
                 // The user may have released fn (or hit esc) while setup was
                 // awaiting. Starting the mic now would leave it hot forever.
                 guard self.isLive(gen) else {
                     Trace.write("start: session ended during setup — tearing down instead of starting the mic")
-                    await self.transcriber.cancel()
+                    await self.transcriber.cancel(session: token)
                     return
                 }
 
@@ -131,6 +159,8 @@ final class DictationController {
 
                 sound("Tink")
                 self.watchInput(gen: gen)
+            } catch is CancellationError {
+                Trace.write("start: setup cancelled (session superseded)")
             } catch {
                 Trace.write("start failed: \(error.localizedDescription)")
                 self.fail(error.localizedDescription, gen: gen)
@@ -145,6 +175,7 @@ final class DictationController {
     func stopAndPaste() {
         guard isRecording else { return }
         let gen = generation
+        let token = sessionToken
         isRecording = false
         onStateChange?(false)
 
@@ -173,27 +204,27 @@ final class DictationController {
 
         // Ignore accidental taps that produced no meaningful audio.
         guard duration > 0.35 else {
-            Task { await transcriber.cancel() }
+            Task { await transcriber.cancel(session: token) }
             overlay.hide()
             return
         }
 
         overlay.setStatus("Transcribing…")
 
-        Task { @MainActor in
+        completionTask = Task { @MainActor in
             // Bound the finish. finalizeAndFinishThroughEndOfInput is an XPC
             // call with no cancellation guarantee; unbounded, a wedged
             // analyzer left "Transcribing…" on screen forever with the
             // transcript silently lost.
-            let finishTask = Task { await self.transcriber.finish() }
+            let finishTask = Task { await self.transcriber.finish(session: token) }
             var stalled = false
             var raw = await Self.race(finishTask, seconds: 10)
             if raw == nil {
                 stalled = true
-                let salvage = await self.transcriber.snapshot()
+                let salvage = await self.transcriber.snapshot(session: token)
                 Trace.write("finish: STALLED past 10s — salvaged \(salvage.count) chars, forcing shutdown")
                 finishTask.cancel()
-                Task { await self.transcriber.cancel() }
+                Task { await self.transcriber.cancel(session: token) }
                 Task { await Transcriber.healthCheck(trigger: "finish-stall") }
                 raw = salvage
             }
@@ -267,11 +298,12 @@ final class DictationController {
         generation += 1
         setupTask?.cancel()
         setupTask = nil
+        let token = sessionToken
         isRecording = false
         startedAt = nil
         onStateChange?(false)
         capture.stop()
-        Task { await transcriber.cancel() }
+        Task { await transcriber.cancel(session: token) }
         overlay.hide()
     }
 

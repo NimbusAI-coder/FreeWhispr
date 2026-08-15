@@ -126,6 +126,10 @@ actor Transcriber {
     private static func reserveTracked(locale: Locale) async throws {
         do {
             _ = try await AssetInventory.reserve(locale: locale)
+        } catch is CancellationError {
+            // An abandoned begin() was cancelled mid-reserve; that is not a
+            // reservation problem and must not be reported as one.
+            throw CancellationError()
         } catch {
             Trace.write("reserve: threw \(error.localizedDescription) — releasing other locales and retrying")
             for held in await AssetInventory.reservedLocales where held.identifier != locale.identifier {
@@ -134,6 +138,8 @@ actor Transcriber {
             }
             do {
                 _ = try await AssetInventory.reserve(locale: locale)
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 Trace.write("reserve: retry FAILED: \(error.localizedDescription)")
                 throw TranscriberError.reservationFailed(error.localizedDescription)
@@ -224,30 +230,68 @@ actor Transcriber {
         return .notReady
     }
 
+    // MARK: - Session identity
+    //
+    // This actor is reentrant: while one session's finish() is suspended in an
+    // XPC call, a new session's begin() can walk in and mutate the shared
+    // state underneath it. The controller's MainActor generation counter
+    // cannot help — the damage happens on THIS actor, after suspension points
+    // — so ownership is checked here, adjacent to the state it protects.
+    // begin() mints an epoch and hands it to the controller; finish/cancel
+    // take it back and no-op when it is stale, and begin() itself re-checks
+    // after every await so an abandoned invocation can never clobber its
+    // successor's pipe, analyzer, or collector.
+
+    /// Identity of the session that currently owns the shared state.
+    private var epoch = 0
+
+    /// Throws if `my` no longer owns the actor state, or if the surrounding
+    /// task was cancelled. Called after every await in begin().
+    private func checkEpoch(_ my: Int) throws {
+        guard my == epoch else { throw CancellationError() }
+        try Task.checkCancellation()
+    }
+
     /// Builds the analyzer and starts consuming the input stream.
-    func begin() async throws {
-        await reset()
+    /// Returns the session token; pass it to finish()/cancel() so a stale
+    /// caller cannot tear down a newer session.
+    func begin() async throws -> Int {
+        epoch += 1
+        let my = epoch
+
+        // Take ownership: tear down whatever the previous session left behind.
+        pipe.close()
+        if let old = analyzer {
+            await old.cancelAndFinishNow()
+        }
+        collectTask?.cancel()
+        analyzer = nil
+        transcriber = nil
+        collectTask = nil
         finalizedText = ""
+        volatileText = ""
+        try checkEpoch(my)
 
         guard SpeechTranscriber.isAvailable else { throw TranscriberError.unavailable }
 
-        Trace.write("begin: resolving locale")
+        Trace.write("begin: session \(my), resolving locale")
         let requested = Locale(identifier: Settings.localeIdentifier)
         guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: requested) else {
             throw TranscriberError.unsupportedLocale(requested.identifier)
         }
+        try checkEpoch(my)
         Trace.write("begin: locale=\(locale.identifier), reserving")
 
         // Progressive preset streams partial results while speaking, so the
         // final text is ready almost immediately after the key is released.
         let module = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
-        transcriber = module
 
         // Reserve before checking status: reservation is what allocates the
         // asset to this app, and `status(forModules:)` reports `.supported`
         // rather than `.installed` until that happens — even when the system
         // already lists the locale in `installedLocales`.
         try await Self.reserveTracked(locale: locale)
+        try checkEpoch(my)
 
         // Short wait only. Recording cannot start until this returns, so a long
         // poll here shows up as an overlay that appears and hears nothing —
@@ -273,12 +317,18 @@ actor Transcriber {
             }
             throw TranscriberError.modelRestoring(locale.identifier)
         }
+        try checkEpoch(my)
         Trace.write("begin: model ready")
 
         guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [module])
         else { throw TranscriberError.noCompatibleFormat }
+        try checkEpoch(my)
 
+        // Point of no return for shared state: everything below is fenced so a
+        // superseded invocation cannot repoint the pipe or fields a newer
+        // session now owns.
         let stream = pipe.open(target: format)
+        transcriber = module
 
         let engine = SpeechAnalyzer(modules: [module])
         analyzer = engine
@@ -292,11 +342,11 @@ actor Transcriber {
             do {
                 for try await result in module.results {
                     guard result.isFinal else {
-                        await self?.noteVolatile(String(result.text.characters))
+                        await self?.noteVolatile(String(result.text.characters), session: my)
                         continue
                     }
                     assembled += String(result.text.characters)
-                    await self?.noteProgress(assembled)
+                    await self?.noteProgress(assembled, session: my)
                 }
             } catch {
                 // A cancelled or failed stream still yields whatever was
@@ -305,19 +355,36 @@ actor Transcriber {
             return assembled
         }
 
-        try await engine.prepareToAnalyze(in: format)
-        try await engine.start(inputSequence: stream)
+        do {
+            try await engine.prepareToAnalyze(in: format)
+            try checkEpoch(my)
+            try await engine.start(inputSequence: stream)
+            try checkEpoch(my)
+        } catch {
+            // This invocation created these objects; if it cannot complete,
+            // it cleans them up — but only if it still owns the shared slots.
+            await engine.cancelAndFinishNow()
+            resetIfCurrent(my)
+            throw error
+        }
+
+        return my
     }
 
-    private func noteProgress(_ text: String) {
+    private func noteProgress(_ text: String, session: Int) {
+        guard session == epoch else { return }
         finalizedText = text
+        // This final supersedes the partial that announced it; keeping the
+        // partial would make snapshot() paste the tail twice.
+        volatileText = ""
     }
 
     /// The in-flight partial. Kept only so a caller could show live text; it is
     /// never appended to the transcript.
     private(set) var volatileText = ""
 
-    private func noteVolatile(_ text: String) {
+    private func noteVolatile(_ text: String, session: Int) {
+        guard session == epoch else { return }
         volatileText = text
     }
 
@@ -332,59 +399,90 @@ actor Transcriber {
     }
 
     /// Closes the input, waits for the analyzer to flush, returns the transcript.
-    func finish() async -> String {
+    ///
+    /// Everything this method needs is captured into locals before its first
+    /// await: the actor is reentrant, so a newer session's begin() may reset
+    /// the shared fields while finalize is suspended. The captured collector
+    /// still yields this session's text even if the newer session cancelled it
+    /// (a cancelled collector returns whatever it had assembled).
+    func finish(session: Int) async -> String {
+        guard session == epoch else {
+            Trace.write("finish: session \(session) superseded before finish could run")
+            return ""
+        }
+
+        let collector = collectTask
+        let engine = analyzer
+        let salvage = finalizedText
         pipe.close()
 
         let counts = pipe.counts
 
         var finalizeError = "none"
-        if let analyzer {
+        if let engine {
             do {
-                try await analyzer.finalizeAndFinishThroughEndOfInput()
+                try await engine.finalizeAndFinishThroughEndOfInput()
             } catch {
                 finalizeError = error.localizedDescription
                 // A failed finalize can leave the results stream open forever,
-                // which would wedge the collectTask await below. Force the
+                // which would wedge the collector await below. Force the
                 // analyzer down so the stream is guaranteed to terminate.
-                await analyzer.cancelAndFinishNow()
+                await engine.cancelAndFinishNow()
             }
         }
 
-        let text = await collectTask?.value ?? finalizedText
+        var text = await collector?.value ?? salvage
+        // A trailing final that arrived during finalize may have grown the
+        // shared text past what the collector returned — but read it only if
+        // this session still owns it.
+        if session == epoch, finalizedText.count > text.count {
+            text = finalizedText
+        }
 
         // The discriminator: volatile partials arriving while finals do not
         // means recognition worked and finalization is at fault. Neither
         // arriving means audio never reached the analyzer. Lengths only —
         // transcript content is never written to the trace.
         Trace.write(
-            "finish: fed=\(counts.fed) yielded=\(counts.yielded) "
+            "finish: session=\(session) fed=\(counts.fed) yielded=\(counts.yielded) "
             + "finalChars=\(text.count) volatileChars=\(volatileText.count) "
             + "finalizeError=\(finalizeError)"
         )
 
-        await reset()
+        resetIfCurrent(session)
 
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Best-effort transcript for stall recovery: everything finalized plus the
     /// current volatile tail. Only used when the normal finish path has already
-    /// wedged — losing a few words beats losing the whole dictation.
-    func snapshot() -> String {
-        (finalizedText + volatileText).trimmingCharacters(in: .whitespacesAndNewlines)
+    /// wedged — losing a few words beats losing the whole dictation. Returns
+    /// nothing for a superseded session so a stall can never paste a *newer*
+    /// dictation's words as this one's.
+    func snapshot(session: Int) -> String {
+        guard session == epoch else { return "" }
+        return (finalizedText + volatileText).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Drops the session without producing text.
-    func cancel() async {
+    /// Drops the session without producing text. Stale callers — cleanup tasks
+    /// left behind by an abandoned or superseded session — are ignored, so
+    /// they can never tear down whichever session is live when they fire.
+    func cancel(session: Int) async {
+        guard session == epoch else {
+            Trace.write("cancel: stale session \(session) ignored (current is \(epoch))")
+            return
+        }
         pipe.close()
         if let analyzer {
             await analyzer.cancelAndFinishNow()
         }
         collectTask?.cancel()
-        await reset()
+        resetIfCurrent(session)
     }
 
-    private func reset() async {
+    /// Clears the shared slots only when `session` still owns them.
+    private func resetIfCurrent(_ session: Int) {
+        guard session == epoch else { return }
         pipe.close()
         analyzer = nil
         transcriber = nil
