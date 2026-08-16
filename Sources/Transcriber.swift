@@ -216,6 +216,10 @@ actor Transcriber {
     /// this the user only finds out mid-dictation. Called periodically and on
     /// wake so a lapsed model is restored *before* the next dictation needs
     /// it. Silent when healthy; logs only when repair work actually happens.
+    /// Called when the process's model view is stale and only a fresh process
+    /// is known to fix it. Set by AppDelegate.
+    nonisolated(unsafe) static var onUnrecoverableStaleView: (@Sendable (String) -> Void)?
+
     static func healthCheck(trigger: String) async {
         guard SpeechTranscriber.isAvailable else { return }
         let requested = Locale(identifier: Settings.localeIdentifier)
@@ -225,7 +229,21 @@ actor Transcriber {
         let module = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
         if await AssetInventory.status(forModules: [module]) == .installed { return }
 
-        Trace.write("health(\(trigger)): model not installed — repairing")
+        // Try the cheap in-process refresh first.
+        await SpeechModels.endRetention()
+        if await AssetInventory.status(forModules: [module]) == .installed {
+            Trace.write("health(\(trigger)): endRetention() refreshed a stale view")
+            return
+        }
+
+        // Measured: after sleep, this process can report the model missing
+        // while a freshly launched one sees it installed and downloadable in
+        // under a second. endRetention() does not clear it. Waiting for the
+        // restore ladder means ~15 minutes of dead dictations for a model
+        // that was never actually gone — so escalate straight to a restart,
+        // which is the only intervention observed to work.
+        Trace.write("health(\(trigger)): model reads missing and endRetention() did not help — stale process view")
+        onUnrecoverableStaleView?(trigger)
         beginBackgroundRestore(locale: locale)
     }
 

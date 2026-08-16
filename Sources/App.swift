@@ -52,7 +52,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
         ) { _ in
-            Task { await Transcriber.healthCheck(trigger: "wake") }
+            // Give the system a few seconds to bring its own services back up
+            // before judging the model missing — checking instantly after wake
+            // would diagnose a transient as a stale view and restart for
+            // nothing.
+            Task {
+                try? await Task.sleep(for: .seconds(5))
+                await Transcriber.healthCheck(trigger: "wake")
+            }
         }
 
         // Last-resort self-heal. Observed in the wild: after long uptime the
@@ -63,6 +70,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // genuine outage (no network for hours) cannot cause a relaunch loop.
         Transcriber.onRestoreFailureStreak = { [weak self] streak in
             Task { @MainActor in self?.recoverFromStuckSpeechService(streak: streak) }
+        }
+        Transcriber.onUnrecoverableStaleView = { [weak self] trigger in
+            Task { @MainActor in self?.recoverFromStaleView(trigger: trigger) }
         }
     }
 
@@ -248,8 +258,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.runModal()
     }
 
+    /// The model view is stale and endRetention() did not clear it. Only a
+    /// fresh process is known to fix this, and it reliably follows sleep — so
+    /// restart now rather than after a quarter hour of failed dictations.
+    private func recoverFromStaleView(trigger: String) {
+        relaunch(reason: "stale model view after \(trigger); endRetention() did not clear it")
+    }
+
     private func recoverFromStuckSpeechService(streak: Int) {
-        guard streak >= 3, !controller.isRecording else { return }
+        guard streak >= 3 else { return }
+        relaunch(reason: "restore failed \(streak)× in-process")
+    }
+
+    private func relaunch(reason: String) {
+        guard !controller.isRecording else {
+            Trace.write("relaunch: deferred (dictation in progress) — \(reason)")
+            return
+        }
 
         // Observed recurring ~70 minutes after launch, so an hourly limit
         // would have blocked the very recovery it exists to allow. Ten
@@ -265,7 +290,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         UserDefaults.standard.set(now, forKey: key)
 
-        Trace.write("relaunch: restore failed \(streak)× in-process — speech service connection presumed stale, restarting")
+        Trace.write("relaunch: \(reason) — restarting")
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
