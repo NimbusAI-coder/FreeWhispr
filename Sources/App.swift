@@ -40,6 +40,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             promptForAccessibility()
         }
 
+        syncLaunchAtLogin()
+
         // Pull the speech model down now so the first dictation is not slow.
         Task { await Transcriber.prewarm() }
         refreshOllamaStatus()
@@ -313,14 +315,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Without this the app simply does not come back after a restart — the
     /// quietest possible failure, and indistinguishable from a bug.
+    /// Re-applies the stored preference to the actual registration. A
+    /// reinstall replaces the bundle and can drop the registration, so intent
+    /// is kept in preferences and reconciled here on every launch.
+    private func syncLaunchAtLogin() {
+        let service = SMAppService.mainApp
+        let wanted = Settings.openAtLogin
+        let isEnabled = (service.status == .enabled)
+        guard wanted != isEnabled else { return }
+        do {
+            if wanted {
+                try service.register()
+                Trace.write("login item: re-registered to match preference")
+            } else {
+                try service.unregister()
+                Trace.write("login item: unregistered to match preference")
+            }
+        } catch {
+            Trace.write("login item: sync failed — \(error.localizedDescription)")
+        }
+    }
+
     @objc private func toggleLaunchAtLogin() {
         let service = SMAppService.mainApp
         do {
             if service.status == .enabled {
                 try service.unregister()
+                Settings.openAtLogin = false
                 Trace.write("login item: disabled")
             } else {
                 try service.register()
+                Settings.openAtLogin = true
                 Trace.write("login item: enabled")
             }
         } catch {

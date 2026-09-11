@@ -13,6 +13,7 @@ enum Settings {
         static let restoreClipboard = "restore_clipboard"
         static let playSounds = "play_sounds"
         static let locale = "locale_identifier"
+        static let openAtLogin = "open_at_login"
     }
 
     static func registerDefaults() {
@@ -57,6 +58,13 @@ enum Settings {
     static var playSounds: Bool {
         get { d.bool(forKey: Key.playSounds) }
         set { d.set(newValue, forKey: Key.playSounds) }
+    }
+
+    /// Mirrors the SMAppService registration so the intent survives a
+    /// reinstall: the app re-registers itself at launch to match this.
+    static var openAtLogin: Bool {
+        get { d.bool(forKey: Key.openAtLogin) }
+        set { d.set(newValue, forKey: Key.openAtLogin) }
     }
 
     static var localeIdentifier: String {
