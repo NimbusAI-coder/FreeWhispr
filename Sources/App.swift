@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import ServiceManagement
 
 @main
 enum FreeWhispr {
@@ -188,6 +189,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        let login = NSMenuItem(
+            title: "Open at Login",
+            action: #selector(toggleLaunchAtLogin),
+            keyEquivalent: ""
+        )
+        login.target = self
+        login.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
+        menu.addItem(login)
+
+        menu.addItem(.separator())
+
         let privacy = NSMenuItem(
             title: "Privacy: audio never leaves this Mac",
             action: nil,
@@ -297,6 +309,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         task.arguments = ["-n", Bundle.main.bundlePath]
         try? task.run()
         NSApp.terminate(nil)
+    }
+
+    /// Without this the app simply does not come back after a restart — the
+    /// quietest possible failure, and indistinguishable from a bug.
+    @objc private func toggleLaunchAtLogin() {
+        let service = SMAppService.mainApp
+        do {
+            if service.status == .enabled {
+                try service.unregister()
+                Trace.write("login item: disabled")
+            } else {
+                try service.register()
+                Trace.write("login item: enabled")
+            }
+        } catch {
+            Trace.write("login item: failed — \(error.localizedDescription)")
+            presentError("""
+                Could not change the Open at Login setting: \
+                \(error.localizedDescription)
+                """)
+        }
+        statusItem?.menu = buildMenu()
     }
 
     @objc private func quit() {
